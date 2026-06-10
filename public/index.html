@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Offline Gradle Nexus Tool</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">OG</div>
+      <div class="brand-text">
+        <h1>Offline Gradle Nexus Tool</h1>
+        <p>Gradle 多模块依赖解析、本地 Maven 仓库导出、Nexus 3 Layout PUT 上传与 fatjar 一致性校验。</p>
+      </div>
+    </div>
+    <div class="header-actions">
+      <span id="jdkBadge" class="chip chip-muted" title="当前可用 JDK">JDK：扫描中…</span>
+      <button id="btnHealth" class="btn btn-ghost" type="button">检查服务</button>
+    </div>
+  </header>
+
+  <main class="app-main">
+    <section class="toolbar card" aria-label="工程目录">
+      <div class="toolbar-row">
+        <label class="field field-grow">
+          <span class="field-label">Gradle 工程目录</span>
+          <input id="workDir" type="text" placeholder="例如 D:\work\my-spring-boot-project" autocomplete="off" />
+        </label>
+        <div class="toolbar-buttons">
+          <button id="btnInspect" class="btn btn-primary" type="button">识别 Gradle 工程</button>
+        </div>
+      </div>
+      <div id="inspectInfo" class="toolbar-info muted">尚未识别工程。先填写工程目录，再点「识别 Gradle 工程」。</div>
+    </section>
+
+    <section class="card accordion" aria-label="配置面板">
+      <details id="basicConfig" class="accordion-item" open>
+        <summary>
+          <span class="accordion-title">基础配置</span>
+          <span class="accordion-hint muted">JDK / Gradle User Home / 导出目录</span>
+        </summary>
+        <div class="accordion-body">
+          <div class="grid grid-3">
+            <label class="field">
+              <span class="field-label">JDK 目录</span>
+              <input id="jdkDir" type="text" placeholder="自动扫描 ~/.jdks 下 JDK 17，可手动覆盖" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span class="field-label">Gradle User Home（可空）</span>
+              <input id="gradleUserHome" type="text" placeholder="默认 ~/.gradle" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span class="field-label">导出目录（可空）</span>
+              <input id="outputDir" type="text" placeholder="默认 <工程目录>\.offline-nexus-bundle" autocomplete="off" />
+            </label>
+          </div>
+          <div class="cluster">
+            <button id="btnScanJdks" class="btn btn-ghost" type="button">扫描 JDK</button>
+            <span id="jdkList" class="muted small">已识别 JDK 列表会显示在这里。</span>
+          </div>
+        </div>
+      </details>
+
+      <details id="repoConfig" class="accordion-item" open>
+        <summary>
+          <span class="accordion-title">额外源仓库（仅 inspect/resolve 阶段叠加）</span>
+          <span class="accordion-hint muted">用于工程已切到只读目标 Nexus、仍需从原始源拉依赖的场景</span>
+        </summary>
+        <div class="accordion-body">
+          <p class="muted small">
+            这里填写的仓库会在 Gradle init script 里前置到工程现有仓库前面，但<strong>不会清空</strong>工程已声明的仓库；
+            仅对本工具自己的 inspect/resolve 任务生效，<strong>不会改写</strong>用户工程的 settings.gradle / build.gradle。
+            典型用法：把仓库切到目标空 Nexus 后，依然能从原 Nexus group（如 maven-public）拉到 SNAPSHOT 与 plugin。
+          </p>
+          <label class="field">
+            <span class="field-label">额外源 Maven 仓库 URL（多个可换行、逗号或分号分隔）</span>
+            <textarea id="sourceRepos" rows="3" placeholder="例如 http://192.168.9.164:8081/repository/maven-public/"></textarea>
+          </label>
+          <div class="grid grid-4">
+            <label class="field">
+              <span class="field-label">源仓库账号</span>
+              <input id="sourceUsername" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span class="field-label">源仓库密码</span>
+              <input id="sourcePassword" type="password" autocomplete="off" />
+            </label>
+            <label class="check">
+              <input id="allowInsecureProtocol" type="checkbox" />
+              <span>允许 HTTP insecure protocol</span>
+            </label>
+            <label class="check">
+              <input id="trustAllSsl" type="checkbox" />
+              <span>忽略 HTTPS 自签证书校验</span>
+            </label>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <nav class="step-tabs" role="tablist" aria-label="工作流">
+      <button class="step-tab active" type="button" role="tab" data-tab="analyze" aria-selected="true">
+        <span class="step-num">1</span><span class="step-title">分析依赖</span>
+      </button>
+      <button class="step-tab" type="button" role="tab" data-tab="verify" aria-selected="false">
+        <span class="step-num">2</span><span class="step-title">验证 fatjar</span>
+      </button>
+      <button class="step-tab" type="button" role="tab" data-tab="upload" aria-selected="false">
+        <span class="step-num">3</span><span class="step-title">上传 Nexus</span>
+      </button>
+    </nav>
+
+    <section id="tab-analyze" class="step-panel card" role="tabpanel">
+      <header class="card-header">
+        <h2>模块与依赖分析</h2>
+        <p class="muted small">基于 Gradle 自身的 ResolutionResult 解析最终依赖图，复用 cacheToken 跳过重复解析。</p>
+      </header>
+
+      <div class="grid grid-3">
+        <label class="field">
+          <span class="field-label">Gradle 模块</span>
+          <select id="targetProject"></select>
+        </label>
+        <label class="field">
+          <span class="field-label">主配置</span>
+          <select id="mainConfiguration">
+            <option value="runtimeClasspath" selected>runtimeClasspath</option>
+            <option value="compileClasspath">compileClasspath</option>
+            <option value="testRuntimeClasspath">testRuntimeClasspath</option>
+            <option value="annotationProcessor">annotationProcessor</option>
+          </select>
+        </label>
+        <div class="field">
+          <span class="field-label">Project 依赖兜底（可空）</span>
+          <div class="row-pair">
+            <input id="fallbackProjectGroup" type="text" placeholder="group" autocomplete="off" />
+            <input id="fallbackProjectVersion" type="text" placeholder="version" autocomplete="off" />
+          </div>
+        </div>
+      </div>
+
+      <div class="chips">
+        <label class="chip-check"><input id="includeTestRuntime" type="checkbox" checked /><span>包含 testRuntimeClasspath</span></label>
+        <label class="chip-check"><input id="includeAnnotationProcessor" type="checkbox" checked /><span>包含 annotationProcessor / testAnnotationProcessor</span></label>
+        <label class="chip-check"><input id="includeBuildscript" type="checkbox" checked /><span>包含 buildscript classpath</span></label>
+        <label class="chip-check"><input id="includePlugins" type="checkbox" checked /><span>尝试包含 Gradle plugin marker 依赖</span></label>
+        <label class="chip-check"><input id="includeSpringBootBundled" type="checkbox" checked /><span>包含 Spring Boot 内置 jar (layertools / tools)</span></label>
+        <label class="chip-check"><input id="cleanOutput" type="checkbox" /><span>下载前清空导出目录</span></label>
+      </div>
+
+      <div class="actions-row">
+        <button id="btnResolve" class="btn btn-primary" type="button">分析依赖树</button>
+        <button id="btnDownload" class="btn btn-secondary" type="button">一键拉取并整理</button>
+      </div>
+
+      <div id="resolveSummary" class="summary-strip" hidden></div>
+
+      <section class="tree-section">
+        <header class="section-header">
+          <h3>依赖树</h3>
+          <div class="tree-toolbar">
+            <input id="treeSearch" type="search" placeholder="过滤节点（group:artifact）" />
+            <button id="btnTreeExpand" class="btn btn-mini" type="button">展开全部</button>
+            <button id="btnTreeCollapse" class="btn btn-mini" type="button">收起全部</button>
+          </div>
+        </header>
+        <div id="treeResultTabs" class="result-tabs" role="tablist"></div>
+        <div class="tree-grid">
+          <div id="treeContainer" class="tree-container">
+            <p class="empty muted">点击「分析依赖树」后展示。</p>
+          </div>
+          <aside id="treeDetail" class="tree-detail">
+            <p class="empty muted">单击左侧节点查看详细信息。</p>
+          </aside>
+        </div>
+      </section>
+
+      <section class="section">
+        <header class="section-header">
+          <h3>识别到的仓库</h3>
+          <span id="repoCount" class="badge badge-soft">0</span>
+        </header>
+        <div id="repoTable" class="table-wrap">
+          <p class="empty muted">识别工程或分析依赖后展示。</p>
+        </div>
+      </section>
+    </section>
+
+    <section id="tab-verify" class="step-panel card hidden" role="tabpanel">
+      <header class="card-header">
+        <h2>验证 fatjar 一致性</h2>
+        <p class="muted small">把工具下载下来的依赖（<code>&lt;outputDir&gt;/repo/*.jar</code>）与 build 出来的 Spring Boot fatjar 内部 <code>BOOT-INF/lib/*.jar</code> 做精确比对。匹配优先级：(group, artifact, version, classifier) &gt; fileName。</p>
+      </header>
+
+      <div class="grid grid-2">
+        <label class="field">
+          <span class="field-label">fatjar 文件绝对路径</span>
+          <input id="fatjarPath" type="text" placeholder="例如 D:\project\build\libs\xxx-0.0.1.jar" autocomplete="off" />
+        </label>
+        <label class="check">
+          <input id="inferGavFromInnerJar" type="checkbox" checked />
+          <span>解析内嵌 jar 的 pom.properties 校准 GAV</span>
+        </label>
+      </div>
+
+      <div class="actions-row">
+        <button id="btnVerifyFatjar" class="btn btn-primary" type="button">开始验证</button>
+      </div>
+
+      <div id="verifySummaryCards" class="summary-cards" hidden></div>
+      <div id="verifyVerdict" class="verdict-strip" hidden></div>
+
+      <section class="section">
+        <div id="verifyResultTabs" class="result-tabs" role="tablist"></div>
+        <div id="verifyResultBody" class="result-body">
+          <p class="empty muted">填写 fatjar 路径后点击「开始验证」。</p>
+        </div>
+      </section>
+    </section>
+
+    <section id="tab-upload" class="step-panel card hidden" role="tabpanel">
+      <header class="card-header">
+        <h2>上传到 Nexus 3</h2>
+        <p class="muted small">扫描本地导出目录后选择目标仓库，按 Maven Layout 通过 PUT 上传。默认 dry-run，确认无误后再实际上传。</p>
+      </header>
+
+      <div class="actions-row">
+        <button id="btnScanBundle" class="btn btn-ghost" type="button">扫描本地导出目录</button>
+      </div>
+      <div id="bundleSummary" class="summary-strip" hidden></div>
+
+      <div class="grid grid-2">
+        <label class="field">
+          <span class="field-label">目标 Nexus Base URL</span>
+          <input id="targetBaseUrl" type="text" placeholder="例如 http://nexus.customer:8081" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">单一目标 Repository（可空）</span>
+          <input id="targetRepository" type="text" placeholder="例如 maven-releases；填写后全部上传到此仓库" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">Release Repository（可空）</span>
+          <input id="releaseRepository" type="text" placeholder="单一仓库为空时使用" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">Snapshot Repository（可空）</span>
+          <input id="snapshotRepository" type="text" placeholder="单一仓库为空时使用" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">目标账号</span>
+          <input id="targetUsername" type="text" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">目标密码</span>
+          <input id="targetPassword" type="password" autocomplete="off" />
+        </label>
+      </div>
+
+      <div class="chips">
+        <label class="chip-check"><input id="targetTrustAllSsl" type="checkbox" /><span>上传时忽略 HTTPS 自签证书校验</span></label>
+        <label class="chip-check"><input id="dryRunUpload" type="checkbox" checked /><span>Dry-run（仅生成上传计划）</span></label>
+      </div>
+
+      <div class="actions-row">
+        <button id="btnUpload" class="btn btn-primary" type="button">上传 / 生成计划</button>
+        <button id="btnRetryFailed" class="btn btn-warn" type="button" disabled>仅重试失败项</button>
+        <span id="retryHint" class="muted small"></span>
+      </div>
+
+      <div id="uploadSummary" class="summary-strip" hidden></div>
+      <div id="uploadTable" class="table-wrap">
+        <p class="empty muted">扫描或上传后会展示完整列表。</p>
+      </div>
+    </section>
+  </main>
+
+  <aside id="logDrawer" class="log-drawer" aria-label="日志抽屉">
+    <header class="log-drawer-header">
+      <button id="logToggle" class="log-toggle" type="button" aria-expanded="false">
+        <span class="log-toggle-icon" aria-hidden="true">▲</span>
+        <span class="log-toggle-text">日志</span>
+        <span id="logCount" class="badge badge-soft">0</span>
+      </button>
+      <button id="btnClearLog" class="btn btn-mini btn-ghost" type="button">清空</button>
+    </header>
+    <pre id="log" class="log-body"></pre>
+  </aside>
+
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>
