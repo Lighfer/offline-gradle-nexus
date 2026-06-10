@@ -44,8 +44,8 @@ offline-gradle-nexus/
     gradle-init-scripts.js        注入 Gradle 的 init script Groovy 模板；v3.6 起额外源仓库为追加语义并按 URL 去重
     gradle-runner.js              Gradle 执行器（默认 daemon+parallel+build-cache）、环境变量、JSON 提取、耗时回传
     inspect-resolve.js            inspect / resolve 高层封装与汇总；resolve 自带 cacheToken + 参数指纹的进程级缓存
-    maven-metadata.js             POM / .module 生成、GA 级 maven-metadata.xml 生成（v3.7，动态版本可解析前提）、校验和（流式多算法 hash）、Gradle 缓存查找、源仓库下载
-    bundle.js                     一键拉取并整理本地 Maven 仓库目录；保留 project artifact classifier，POM/.module 主 artifact 单点生成；目录型 artifact 跳过 + 同源文件 artifact 去重（v3.6）；POM 闭包 BFS 递归补齐 + 写出 GA 级 maven-metadata.xml（v3.7）
+    maven-metadata.js             POM / .module 生成、GA 级 maven-metadata.xml 生成（v3.7，动态版本可解析前提）、校验和（流式多算法 hash）、Gradle 缓存查找、源仓库下载；POM 父链属性域遍历器（v3.8）
+    bundle.js                     一键拉取并整理本地 Maven 仓库目录；保留 project artifact classifier，POM/.module 主 artifact 单点生成；目录型 artifact 跳过 + 同源文件 artifact 去重（v3.6）；POM 闭包 BFS 递归补齐 + 写出 GA 级 maven-metadata.xml（v3.7）；BFS 父链属性感知 + pending 重扫（v3.8）
     wrapper-export.js             Gradle wrapper distribution 导出
     bundle-upload.js              扫描本地 bundle 与 Nexus 3 PUT 上传
     zip-reader.js                 零依赖最小 ZIP/JAR 读取器（含 ZIP64）
@@ -480,3 +480,18 @@ Node.js 下载/上传会按该选项关闭证书校验。Gradle 侧也会注入�
 - bundle 产出含新生成的 GA `maven-metadata.xml` 与 sa-token 闭包（`sa-token-dependencies`/`sa-token-bom`/`oss-parent`），upload **9981/9981** 全部 PUT 成功；
 - HTTP 复核：`base-credential-client/server/driver-all-spring-boot-starter`、`system-sdk` 等的 `maven-metadata.xml` 均返回 200，且 `+` 解析到的版本（client→`0.0.21.6`、system-sdk→`0.0.3`）其 `-plain.jar` + `.module` + `.pom` 均已在目标仓库（这些库以 Gradle Module Metadata 发布，实际产物为 `-plain.jar`，解析以 `.module` 为准）；
 - **最严格验证**：用全新空 `GRADLE_USER_HOME`（仅以目录联接复用本机 gradle-8.4 发行版，无任何依赖缓存），强制所有依赖 / 插件（spring-boot 3.2.4、dependency-management 1.1.4、buildinfo、jib 等 marker+impl）/ 版本目录（`com.thtf.base:management:0.0.98`）全部从 235 实时解析，`.\gradlew.bat :application-web:bootJar` **BUILD SUCCESSFUL（5m13s，53/53 任务执行）**，产出 `agent-development-executor-server-0.1.4.1.jar`（约 383MB 的 Spring Boot 可执行胖包）。
+
+## 本次（v3.8）变更
+
+### v3.8 Bug 修复
+
+- **import BOM 版本属性定义在父 POM 时被静默漏抓，离线构建报 `Could not parse POM`**：典型案例为 `com.alibaba:fastjson:2.0.58`——其 `dependencyManagement` 以 `scope=import` 引入 `spring-framework-bom:${springframework5.version}`、`spring-data-bom:${springdata2021.version}`、`spring-security-bom:${springsecurity5.version}`，而这 3 个属性定义在父 POM `com.alibaba.fastjson2:fastjson2-parent:2.0.58` 的 `<properties>` 中。v3.7 的 `parsePomExtraModules` 只用本 POM 属性域求值，这 3 个 BOM 被归入 `unresolved` 仅记 warning，目标仓库因此缺失 `spring-security-bom:5.8.8` 等坐标，Gradle 解析 fastjson effective POM 时直接失败。修复分两层：
+  - `lib/maven-metadata.js` 新增 `collectAncestorProps`：沿 `parent` 链读取 repo 目录已落盘的祖先 POM，合并其 `<properties>`（就近祖先优先，与 Maven 子覆盖父的继承语义一致）；`buildPomPropertyScope` / `parsePomExtraModules` 接受祖先属性域入参；`resolvePomValue` 同时支持整段（`${a.version}`）与内嵌（`1.2.${patch}`）占位符迭代求值。
+  - `lib/bundle.js` 的 POM 闭包 BFS 升级为父链属性感知：父链尚未完整落盘且存在未求值占位符的 POM 进入 pending，待其父 POM 在后续轮次下载落盘后自动重扫求值；BFS 收敛后仍无法求值的才写入 `pom-extra-version-unresolved` warning（附 `missingParent` 字段），缺口可见、可诊断。
+
+### v3.8 真实链路验证（fine-tuning-configuration-server）
+
+- 代码级：用 164 源仓库的真实 `fastjson-2.0.58.pom` + `fastjson2-parent-2.0.58.pom` 模拟两轮 BFS，第 1 轮正确挂起 3 个占位符 import 并报告 missingParent，第 2 轮父 POM 落盘后精确提取 `spring-framework-bom:5.3.31`、`spring-data-bom:2021.2.18`、`spring-security-bom:5.8.8`；
+- bundle 重跑：608 个 artifact、2016 个 metadata、**0 errors、0 条 pom-extra-version-unresolved**（v3.7 下同场景该 warning 非零且对应坐标缺失）；
+- upload **7884/7884** 全部 PUT 成功至 235 `zntpt`，5 个关键 POM（3 个 spring BOM + fastjson2-parent + fastjson）HTTP 复核均 200；
+- 终验：全新空 `GRADLE_USER_HOME`（仅联接复用 wrapper 发行版），工程仓库仅指向 235 `zntpt`，`.\gradlew.bat :application-web:clean :application-web:build -x test` **BUILD SUCCESSFUL（2m50s）**，曾失败的 `:application-web:bootJar` 任务正常完成，产出约 350MB 的 Spring Boot 胖包。
